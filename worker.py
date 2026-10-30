@@ -22,8 +22,8 @@ log = logging.getLogger("gosplan")
 
 
 class Failure(Exception):
-    def __init__(self, status, code):
-        self.status, self.code = status, code
+    def __init__(self, status, code, parameter=None):
+        self.status, self.code, self.parameter = status, code, parameter
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -132,14 +132,18 @@ def request_openai(payload, key):
             return body
     except urllib.error.HTTPError as error:
         code = "upstream_error"
+        parameter = None
         try:
             parsed = json.loads(error.read(32768))
             candidate = parsed.get("error", {}).get("code")
-            if candidate in {"unsupported_country_region_territory", "insufficient_quota", "credit_balance_exhausted", "billing_not_active", "invalid_api_key", "model_not_found"}:
+            if candidate in {"unsupported_country_region_territory", "insufficient_quota", "credit_balance_exhausted", "billing_not_active", "invalid_api_key", "model_not_found", "unsupported_value", "unsupported_parameter", "invalid_value", "missing_required_parameter", "context_length_exceeded"}:
                 code = candidate
+            param = parsed.get("error", {}).get("param")
+            if isinstance(param, str) and re.fullmatch(r"[a-zA-Z0-9_.\[\]-]{1,100}", param):
+                parameter = param
         except (ValueError, AttributeError):
             pass
-        raise Failure(error.code if error.code in {400, 401, 403, 404, 429} else 502, code) from None
+        raise Failure(error.code if error.code in {400, 401, 403, 404, 429} else 502, code, parameter) from None
     except (urllib.error.URLError, TimeoutError, OSError):
         raise Failure(502, "upstream_unavailable") from None
     except ValueError:
@@ -186,7 +190,10 @@ def application(environ, start_response):
         result = request_openai(payload_from(body, model), key)
         return respond(start_response, 200, result)
     except Failure as error:
-        body = json.dumps({"error": {"code": error.code}}).encode()
+        detail = {"code": error.code}
+        if error.parameter:
+            detail["param"] = error.parameter
+        body = json.dumps({"error": detail}).encode()
         return respond(start_response, error.status, body)
     except Exception:
         return respond(start_response, 502, b'{"error":{"code":"worker_error"}}')
