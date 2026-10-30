@@ -121,7 +121,7 @@ def request_openai(payload, key):
     request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(payload).encode(),
                                      headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.build_opener(NoRedirect()).open(request, timeout=85) as response:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=240) as response:
             body = response.read(MAX_RESPONSE + 1)
             if len(body) > MAX_RESPONSE:
                 raise Failure(502, "upstream_response_too_large")
@@ -146,7 +146,13 @@ def request_openai(payload, key):
         except (ValueError, AttributeError):
             pass
         raise Failure(error.code if error.code in {400, 401, 403, 404, 429} else 502, code, parameter) from None
-    except (urllib.error.URLError, TimeoutError, OSError):
+    except TimeoutError:
+        raise Failure(502, "upstream_timeout") from None
+    except urllib.error.URLError as error:
+        if isinstance(error.reason, TimeoutError):
+            raise Failure(502, "upstream_timeout") from None
+        raise Failure(502, "upstream_unavailable") from None
+    except OSError:
         raise Failure(502, "upstream_unavailable") from None
     except ValueError:
         raise Failure(502, "upstream_invalid_json") from None
@@ -192,6 +198,7 @@ def application(environ, start_response):
         result = request_openai(payload_from(body, model), key)
         return respond(start_response, 200, result)
     except Failure as error:
+        log.warning("request_failed status=%s code=%s", error.status, error.code)
         detail = {"code": error.code}
         if error.parameter:
             detail["param"] = error.parameter
