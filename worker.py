@@ -109,7 +109,9 @@ def payload_from(body, model):
                     raise ValueError()
             else:
                 raise ValueError()
-        return {"model": model, "store": False, "instructions": instructions, "input": messages,
+        # JSON mode validates the input context separately from instructions.
+        normalized = [{"role": "user", "content": [{"type": "input_text", "text": "Return the result as JSON."}, *content]}]
+        return {"model": model, "store": False, "instructions": instructions, "input": normalized,
                 "max_output_tokens": 12000, "text": {"format": {"type": "json_object"}}}
     except (ValueError, KeyError, TypeError, AttributeError, IndexError):
         raise Failure(400, "invalid_payload") from None
