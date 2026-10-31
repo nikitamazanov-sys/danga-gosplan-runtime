@@ -18,6 +18,9 @@ _lock = threading.Lock()
 _slots = threading.BoundedSemaphore(2)
 _nonces = {}
 _calls = []
+_poll_calls = []
+_jobs = {}
+JOB_TTL = 900
 log = logging.getLogger("gosplan")
 
 
@@ -40,7 +43,7 @@ def settings():
     return key, secret, model
 
 
-def authenticate(environ, body, secret):
+def authenticate(environ, body, secret, poll=False):
     stamp = environ.get("HTTP_X_GOSPLAN_TIMESTAMP", "")
     nonce = environ.get("HTTP_X_GOSPLAN_NONCE", "")
     signature = environ.get("HTTP_X_GOSPLAN_SIGNATURE", "")
@@ -55,13 +58,14 @@ def authenticate(environ, body, secret):
     with _lock:
         for old in [n for n, expiry in _nonces.items() if expiry <= now]:
             del _nonces[old]
-        _calls[:] = [t for t in _calls if now - t < 60]
+        calls = _poll_calls if poll else _calls
+        calls[:] = [t for t in calls if now - t < 60]
         if nonce in _nonces:
             raise Failure(409, "replayed_request")
-        if len(_nonces) >= 4096 or len(_calls) >= 10:
+        if len(_nonces) >= 4096 or len(calls) >= (120 if poll else 10):
             raise Failure(429, "worker_rate_limit")
         _nonces[nonce] = now + 2 * WINDOW
-        _calls.append(now)
+        calls.append(now)
 
 
 def unique_object(pairs):
@@ -194,13 +198,76 @@ def request_openai(payload, key):
 
 
 def respond(start_response, status, body, extra_headers=()):
-    labels = {200: "OK", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed", 409: "Conflict", 411: "Length Required", 413: "Content Too Large", 415: "Unsupported Media Type", 429: "Too Many Requests", 502: "Bad Gateway", 503: "Service Unavailable"}
+    labels = {200: "OK", 202: "Accepted", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed", 409: "Conflict", 411: "Length Required", 413: "Content Too Large", 415: "Unsupported Media Type", 429: "Too Many Requests", 502: "Bad Gateway", 503: "Service Unavailable"}
     headers = [("Content-Type", "application/json"), ("Content-Length", str(len(body))), ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff")]
     if status in {429, 503}:
         headers.append(("Retry-After", "30"))
     headers.extend(extra_headers)
     start_response(f"{status} {labels.get(status, 'Error')}", headers)
     return [body]
+
+
+def run_job(job_id, payload, key):
+    try:
+        result = request_openai(payload, key)
+        with _lock:
+            _jobs[job_id].update(status="succeeded", result=result, finished=time.time())
+        log.warning("job_completed job_id=%s response_bytes=%d", job_id, len(result))
+    except Failure as error:
+        with _lock:
+            _jobs[job_id].update(status="failed", error=error, finished=time.time())
+        log.warning("job_failed job_id=%s code=%s", job_id, error.code)
+    except Exception:
+        with _lock:
+            _jobs[job_id].update(status="failed", error=Failure(502, "worker_error"), finished=time.time())
+    finally:
+        _slots.release()
+
+
+def job_request(body, model, key, result_only=False):
+    try:
+        raw = json.loads(body, object_pairs_hook=unique_object)
+        if not isinstance(raw, dict) or set(raw) != ({"job_id"} if result_only else {"job_id", "request"}):
+            raise ValueError()
+        job_id = raw["job_id"]
+        if not isinstance(job_id, str) or not re.fullmatch(r"[a-f0-9]{32}", job_id):
+            raise ValueError()
+    except (ValueError, KeyError, TypeError):
+        raise Failure(400, "invalid_payload") from None
+    digest = hashlib.sha256(body).hexdigest()
+    with _lock:
+        for old in [j for j, v in _jobs.items() if v.get("finished", time.time()) < time.time() - JOB_TTL]:
+            del _jobs[old]
+        existing = _jobs.get(job_id)
+        if existing:
+            if not result_only and existing["digest"] != digest:
+                raise Failure(409, "job_conflict")
+            if result_only and existing["status"] == "succeeded":
+                return 200, existing["result"]
+            if result_only and existing["status"] == "failed":
+                raise existing["error"]
+            return 202, b'{"pending":true}'
+        if result_only:
+            raise Failure(404, "job_not_found")
+    payload = payload_from(json.dumps(raw["request"]).encode(), model)
+    with _lock:
+        # Recheck after validation: concurrent duplicate submits must not pay twice.
+        existing = _jobs.get(job_id)
+        if existing:
+            if existing["digest"] != digest:
+                raise Failure(409, "job_conflict")
+            return 202, b'{"pending":true}'
+        if len(_jobs) >= 16 or not _slots.acquire(blocking=False):
+            raise Failure(503, "worker_busy")
+        _jobs[job_id] = {"status": "running", "digest": digest, "created": time.time()}
+    try:
+        threading.Thread(target=run_job, args=(job_id, payload, key), daemon=True).start()
+    except Exception:
+        with _lock:
+            del _jobs[job_id]
+        _slots.release()
+        raise
+    return 202, b'{"pending":true}'
 
 
 def application(environ, start_response):
@@ -212,7 +279,7 @@ def application(environ, start_response):
         if path == "/readyz" and method == "GET":
             settings()
             return respond(start_response, 200, b'{"status":"configured"}')
-        if path != "/v1/analyze":
+        if path not in {"/v1/analyze", "/v1/jobs", "/v1/jobs/result"}:
             raise Failure(404, "not_found")
         if method != "POST":
             raise Failure(405, "method_not_allowed")
@@ -224,13 +291,16 @@ def application(environ, start_response):
             raise Failure(411, "content_length_required")
         if len(length) > 9 or not 1 <= int(length) <= MAX_BODY:
             raise Failure(413, "payload_too_large")
-        acquired = _slots.acquire(blocking=False)
-        if not acquired:
-            raise Failure(503, "worker_busy")
         body = environ["wsgi.input"].read(int(length))
         if len(body) != int(length):
             raise Failure(400, "incomplete_body")
-        authenticate(environ, body, secret)
+        authenticate(environ, body, secret, poll=path == "/v1/jobs/result")
+        if path != "/v1/analyze":
+            status, result = job_request(body, model, key, result_only=path == "/v1/jobs/result")
+            return respond(start_response, status, result)
+        acquired = _slots.acquire(blocking=False)
+        if not acquired:
+            raise Failure(503, "worker_busy")
         payload = payload_from(body, model)
         started = time.monotonic()
         result = request_openai(payload, key)
@@ -257,3 +327,4 @@ def application(environ, start_response):
     finally:
         if acquired:
             _slots.release()
+
