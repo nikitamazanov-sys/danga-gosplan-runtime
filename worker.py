@@ -73,6 +73,36 @@ def unique_object(pairs):
     return obj
 
 
+
+def usage_metrics(response_bytes, model):
+    """Extract token counts and a *non-billing* estimate, without document content."""
+    try:
+        response = json.loads(response_bytes)
+        usage = response.get("usage") if isinstance(response, dict) else None
+        if not isinstance(usage, dict):
+            return None
+        input_tokens = usage.get("input_tokens")
+        output_tokens = usage.get("output_tokens")
+        detail = usage.get("input_tokens_details") or {}
+        cached = detail.get("cached_tokens", 0) if isinstance(detail, dict) else None
+        numbers = (input_tokens, output_tokens, cached)
+        if any(type(value) is not int or value < 0 or value > 100_000_000 for value in numbers):
+            return None
+        if cached > input_tokens:
+            return None
+        # Standard short-context public list price, not an invoice or a spending cap.
+        rates = {"gpt-6.1-terra": (1.00, 0.05, 5.00)}
+        estimate = None
+        if model in rates:
+            ordinary_in, cached_in, out = rates[model]
+            estimate = ((input_tokens - cached) * ordinary_in
+                        + cached * cached_in + output_tokens * out) / 1_000_000
+        return {"input": input_tokens, "output": output_tokens,
+                "cached": cached, "estimated_usd": estimate}
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
 def payload_from(body, model):
     try:
         raw = json.loads(body, object_pairs_hook=unique_object)
@@ -128,9 +158,14 @@ def request_openai(payload, key):
             result = json.loads(body)
             if not isinstance(result, dict) or result.get("status") != "completed":
                 raise Failure(502, "upstream_incomplete")
-            usage = result.get("usage", {})
-            # Counts only: never log prompts, drawings, keys, or upstream error text.
-            log.warning("openai_usage input=%s output=%s", usage.get("input_tokens"), usage.get("output_tokens"))
+            metrics = usage_metrics(body, payload["model"])
+            if metrics is not None:
+                # These records survive Free-tier sleeps in the hosting logs.
+                log.warning(
+                    "openai_usage model=%s input=%d cached=%d output=%d estimated_usd=%s",
+                    payload["model"], metrics["input"], metrics["cached"], metrics["output"],
+                    "%.6f" % metrics["estimated_usd"] if metrics["estimated_usd"] is not None else "unknown"
+                )
             return body
     except urllib.error.HTTPError as error:
         code = "upstream_error"
@@ -158,11 +193,12 @@ def request_openai(payload, key):
         raise Failure(502, "upstream_invalid_json") from None
 
 
-def respond(start_response, status, body):
+def respond(start_response, status, body, extra_headers=()):
     labels = {200: "OK", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed", 409: "Conflict", 411: "Length Required", 413: "Content Too Large", 415: "Unsupported Media Type", 429: "Too Many Requests", 502: "Bad Gateway", 503: "Service Unavailable"}
     headers = [("Content-Type", "application/json"), ("Content-Length", str(len(body))), ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff")]
     if status in {429, 503}:
         headers.append(("Retry-After", "30"))
+    headers.extend(extra_headers)
     start_response(f"{status} {labels.get(status, 'Error')}", headers)
     return [body]
 
@@ -195,8 +231,20 @@ def application(environ, start_response):
         if len(body) != int(length):
             raise Failure(400, "incomplete_body")
         authenticate(environ, body, secret)
-        result = request_openai(payload_from(body, model), key)
-        return respond(start_response, 200, result)
+        payload = payload_from(body, model)
+        started = time.monotonic()
+        result = request_openai(payload, key)
+        headers = [("X-Gosplan-Processing-Ms", str(round((time.monotonic() - started) * 1000)))]
+        metrics = usage_metrics(result, model)
+        if metrics is not None:
+            headers.extend([
+                ("X-Gosplan-Input-Tokens", str(metrics["input"])),
+                ("X-Gosplan-Cached-Input-Tokens", str(metrics["cached"])),
+                ("X-Gosplan-Output-Tokens", str(metrics["output"])),
+            ])
+            if metrics["estimated_usd"] is not None:
+                headers.append(("X-Gosplan-Estimated-USD", "%.6f" % metrics["estimated_usd"]))
+        return respond(start_response, 200, result, headers)
     except Failure as error:
         log.warning("request_failed status=%s code=%s", error.status, error.code)
         detail = {"code": error.code}
