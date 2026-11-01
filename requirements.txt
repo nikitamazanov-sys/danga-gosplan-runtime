@@ -1,1 +1,5 @@
 gunicorn>=23,<24
+ctranslate2==4.8.4
+sentencepiece==0.2.1
+PyYAML==6.0.3
+

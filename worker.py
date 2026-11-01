@@ -16,6 +16,7 @@ MAX_RESPONSE = 2 * 1024 * 1024
 WINDOW = 120
 _lock = threading.Lock()
 _slots = threading.BoundedSemaphore(2)
+_translation_slot = threading.BoundedSemaphore(1)
 _nonces = {}
 _calls = []
 _poll_calls = []
@@ -272,6 +273,7 @@ def job_request(body, model, key, result_only=False):
 
 def application(environ, start_response):
     acquired = False
+    translation_acquired = False
     try:
         path, method = environ.get("PATH_INFO", ""), environ.get("REQUEST_METHOD", "")
         if path == "/healthz" and method == "GET":
@@ -279,7 +281,7 @@ def application(environ, start_response):
         if path == "/readyz" and method == "GET":
             settings()
             return respond(start_response, 200, b'{"status":"configured"}')
-        if path not in {"/v1/analyze", "/v1/jobs", "/v1/jobs/result"}:
+        if path not in {"/v1/analyze", "/v1/jobs", "/v1/jobs/result", "/v1/translate"}:
             raise Failure(404, "not_found")
         if method != "POST":
             raise Failure(405, "method_not_allowed")
@@ -291,10 +293,25 @@ def application(environ, start_response):
             raise Failure(411, "content_length_required")
         if len(length) > 9 or not 1 <= int(length) <= MAX_BODY:
             raise Failure(413, "payload_too_large")
+        if path == '/v1/translate' and int(length)>65536:
+            raise Failure(413,'payload_too_large')
         body = environ["wsgi.input"].read(int(length))
         if len(body) != int(length):
             raise Failure(400, "incomplete_body")
         authenticate(environ, body, secret, poll=path == "/v1/jobs/result")
+        if path == '/v1/translate':
+            with _lock:
+                if any(job.get('status')=='running' for job in _jobs.values()):raise Failure(503,'drawing_priority')
+            translation_acquired=_translation_slot.acquire(blocking=False)
+            if not translation_acquired:raise Failure(503,'translation_busy')
+            acquired=_slots.acquire(blocking=False)
+            if not acquired:raise Failure(503,'worker_busy')
+            import free_translate
+            try:
+                texts=free_translate.validate(json.loads(body,object_pairs_hook=unique_object))
+                translated=free_translate.translate(texts)
+            except (ValueError,TypeError,KeyError):raise Failure(400,'invalid_translation_payload') from None
+            return respond(start_response,200,json.dumps({'texts':translated,'engine':'opus-mt-en-ru','paid_api_calls':0},ensure_ascii=False).encode())
         if path != "/v1/analyze":
             status, result = job_request(body, model, key, result_only=path == "/v1/jobs/result")
             return respond(start_response, status, result)
@@ -327,4 +344,7 @@ def application(environ, start_response):
     finally:
         if acquired:
             _slots.release()
+        if translation_acquired:
+            _translation_slot.release()
+
 
