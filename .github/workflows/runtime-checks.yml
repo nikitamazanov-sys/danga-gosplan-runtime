@@ -1,0 +1,27 @@
+name: Danga drawing processor checks
+on:
+  pull_request:
+  push:
+    branches: [main, 'ops/runtime-ci-*']
+permissions:
+  contents: read
+concurrency:
+  group: danga-runtime-checks-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check Python syntax
+        run: python -m py_compile worker.py free_translate.py build_translation_model.py
+      - name: Test jobs, metering and translation without paid calls
+        run: python -m unittest -v test_async_jobs test_metering test_translation
+      - name: Report release status
+        run: echo 'Tests only; no Render deployment was attempted.' >> "$GITHUB_STEP_SUMMARY"
