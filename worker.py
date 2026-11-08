@@ -208,6 +208,63 @@ def respond(start_response, status, body, extra_headers=()):
     return [body]
 
 
+def realtime_request(body, key, end=False):
+    """Signalling only: microphone and synthesized audio travel over WebRTC."""
+    try:
+        raw = json.loads(body, object_pairs_hook=unique_object)
+        if end:
+            if set(raw) != {"call_id"} or not re.fullmatch(r"rtc_[A-Za-z0-9_-]{8,160}", raw["call_id"]):
+                raise ValueError()
+            request = urllib.request.Request("https://api.openai.com/v1/realtime/calls/" + raw["call_id"] + "/hangup",
+                                             data=b"", headers={"Authorization": "Bearer " + key}, method="POST")
+        else:
+            if set(raw) != {"sdp", "instructions", "user"}:
+                raise ValueError()
+            sdp, instructions, user = raw["sdp"], raw["instructions"], raw["user"]
+            if not isinstance(sdp, str) or not sdp.startswith("v=0") or len(sdp) > 48000 or "m=audio " not in sdp:
+                raise ValueError()
+            if not isinstance(instructions, str) or not 1 <= len(instructions) <= 24000 or not re.fullmatch(r"[a-f0-9]{64}", user):
+                raise ValueError()
+            session = {"type": "realtime", "model": "gpt-realtime-2.1-mini", "instructions": instructions,
+                       "max_output_tokens": 600, "truncation": {"type": "retention_ratio", "retention_ratio": 0.8, "token_limits": {"post_instructions": 8000}}, "audio": {"input": {
+                           "noise_reduction": {"type": "near_field"},
+                           "transcription": {"model": "gpt-transcribe", "language": "ru"},
+                           "turn_detection": {"type": "semantic_vad", "eagerness": "medium", "create_response": True, "interrupt_response": True}},
+                           "output": {"voice": "cedar"}}}
+            boundary = "academy-" + os.urandom(16).hex()
+            parts = []
+            for name, value in (("sdp", sdp), ("session", json.dumps(session, ensure_ascii=False))):
+                parts.append(("--" + boundary + '\r\nContent-Disposition: form-data; name="' + name + '"\r\n\r\n' + value + "\r\n").encode())
+            encoded = b"".join(parts) + ("--" + boundary + "--\r\n").encode()
+            request = urllib.request.Request("https://api.openai.com/v1/realtime/calls", data=encoded,
+                        headers={"Authorization": "Bearer " + key, "Content-Type": "multipart/form-data; boundary=" + boundary,
+                                 "OpenAI-Safety-Identifier": user}, method="POST")
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise Failure(400, "invalid_voice_payload") from None
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
+            answer = response.read(65537)
+            if end:
+                return json.dumps({"ended": True}).encode()
+            call_id = response.headers.get("Location", "").rstrip("/").split("/")[-1]
+            if len(answer) > 65536 or not answer.startswith(b"v=0") or not re.fullmatch(r"rtc_[A-Za-z0-9_-]{8,160}", call_id):
+                raise Failure(502, "invalid_voice_answer")
+            return json.dumps({"sdp": answer.decode(), "call_id": call_id, "model": session["model"]}).encode()
+    except urllib.error.HTTPError as error:
+        if end and error.code == 404:
+            return b'{"ended":true}'
+        code = "voice_upstream_error"
+        try:
+            candidate = json.loads(error.read(16384)).get("error", {}).get("code")
+            if candidate in {"model_not_found", "insufficient_quota", "billing_not_active", "invalid_api_key", "unsupported_country_region_territory"}:
+                code = candidate
+        except (ValueError, AttributeError):
+            pass
+        raise Failure(error.code if error.code in {400, 401, 403, 404, 429} else 502, code) from None
+    except (OSError, TimeoutError, ValueError):
+        raise Failure(502, "voice_upstream_unavailable") from None
+
+
 def run_job(job_id, payload, key):
     try:
         result = request_openai(payload, key)
@@ -281,7 +338,7 @@ def application(environ, start_response):
         if path == "/readyz" and method == "GET":
             settings()
             return respond(start_response, 200, b'{"status":"configured"}')
-        if path not in {"/v1/analyze", "/v1/jobs", "/v1/jobs/result", "/v1/translate"}:
+        if path not in {"/v1/analyze", "/v1/jobs", "/v1/jobs/result", "/v1/translate", "/v1/academy/realtime", "/v1/academy/realtime/end"}:
             raise Failure(404, "not_found")
         if method != "POST":
             raise Failure(405, "method_not_allowed")
@@ -299,6 +356,10 @@ def application(environ, start_response):
         if len(body) != int(length):
             raise Failure(400, "incomplete_body")
         authenticate(environ, body, secret, poll=path == "/v1/jobs/result")
+        if path.startswith('/v1/academy/realtime'):
+            if len(body) > 100000:
+                raise Failure(413, 'payload_too_large')
+            return respond(start_response, 200, realtime_request(body, key, end=path.endswith('/end')))
         if path == '/v1/translate':
             with _lock:
                 if any(job.get('status')=='running' for job in _jobs.values()):raise Failure(503,'drawing_priority')
@@ -346,5 +407,6 @@ def application(environ, start_response):
             _slots.release()
         if translation_acquired:
             _translation_slot.release()
+
 
 
