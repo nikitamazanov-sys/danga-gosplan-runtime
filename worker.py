@@ -21,6 +21,7 @@ _nonces = {}
 _calls = []
 _poll_calls = []
 _jobs = {}
+_renstroy_jobs = {}
 JOB_TTL = 900
 log = logging.getLogger("gosplan")
 
@@ -338,6 +339,8 @@ def application(environ, start_response):
         if path == "/readyz" and method == "GET":
             settings()
             return respond(start_response, 200, b'{"status":"configured"}')
+        if path.startswith('/v1/renstroy/'):
+            return renstroy_application(environ, start_response)
         if path not in {"/v1/analyze", "/v1/jobs", "/v1/jobs/result", "/v1/translate", "/v1/academy/realtime", "/v1/academy/realtime/end"}:
             raise Failure(404, "not_found")
         if method != "POST":
@@ -407,6 +410,84 @@ def application(environ, start_response):
             _slots.release()
         if translation_acquired:
             _translation_slot.release()
+
+
+RENSTROY_ORIGINS = {'https://renstroy.com', 'https://www.renstroy.com'}
+
+
+def redeem_renstroy_ticket(ticket, digest):
+    """A short-lived capability from the existing founder session; no shared key copy."""
+    encoded = json.dumps({'action': 'estimate-ai-redeem', 'ticket': ticket, 'payloadHash': digest}).encode()
+    request = urllib.request.Request('https://cabinet.renstroy.com/api/office', data=encoded, method='POST',
+        headers={'Content-Type': 'application/json', 'Origin': 'https://renstroy.com', 'X-Renstroy': '1'})
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=15) as response:
+            result = json.loads(response.read(4096))
+            if result.get('authorized') is not True:
+                raise ValueError()
+    except (OSError, ValueError, AttributeError):
+        raise Failure(401, 'invalid_renstroy_ticket') from None
+
+
+def renstroy_application(environ, start_response):
+    origin = environ.get('HTTP_ORIGIN', '')
+    cors = [('Access-Control-Allow-Origin', origin), ('Vary', 'Origin')] if origin in RENSTROY_ORIGINS else []
+    if environ.get('REQUEST_METHOD') == 'OPTIONS':
+        if origin not in RENSTROY_ORIGINS:
+            return respond(start_response, 403, b'{"error":{"code":"origin_denied"}}')
+        return respond(start_response, 200, b'{}', cors + [('Access-Control-Allow-Methods', 'POST, OPTIONS'),
+            ('Access-Control-Allow-Headers', 'Content-Type'), ('Access-Control-Max-Age', '600')])
+    try:
+        path = environ.get('PATH_INFO')
+        if path not in {'/v1/renstroy/start', '/v1/renstroy/result'}:
+            raise Failure(404, 'not_found')
+        if environ.get('REQUEST_METHOD') != 'POST':
+            raise Failure(405, 'method_not_allowed')
+        if environ.get('CONTENT_TYPE', '').split(';')[0] != 'application/json':
+            raise Failure(415, 'json_required')
+        length = environ.get('CONTENT_LENGTH', '')
+        if not length.isdigit() or not 1 <= int(length) <= 400000:
+            raise Failure(413, 'payload_too_large')
+        raw = json.loads(environ['wsgi.input'].read(int(length)), object_pairs_hook=unique_object)
+        job_id, poll_token = raw.get('job_id'), raw.get('poll_token')
+        if not isinstance(job_id, str) or not re.fullmatch('[a-f0-9]{32}', job_id) or not isinstance(poll_token, str) or not re.fullmatch('[a-f0-9]{64}', poll_token):
+            raise Failure(400, 'invalid_payload')
+        token_hash = hashlib.sha256(poll_token.encode()).hexdigest()
+        key, _, model = settings()
+        with _lock:
+            for old in [j for j, v in _renstroy_jobs.items() if v['expires'] < time.time()]:
+                del _renstroy_jobs[old]
+            existing = _renstroy_jobs.get(job_id)
+        if existing and not hmac.compare_digest(existing['token_hash'], token_hash):
+            raise Failure(401, 'invalid_job_token')
+        if path.endswith('/result'):
+            if set(raw) != {'job_id', 'poll_token'} or not existing:
+                raise Failure(404, 'job_not_found')
+            status, body = job_request(json.dumps({'job_id': job_id}).encode(), model, key, result_only=True)
+            return respond(start_response, status, body, cors)
+        if set(raw) != {'job_id', 'poll_token', 'ticket', 'payload_json'} or not isinstance(raw['payload_json'], str) or len(raw['payload_json']) > 180000 or not isinstance(raw['ticket'], str) or not re.fullmatch('[a-f0-9]{64}', raw['ticket']):
+            raise Failure(400, 'invalid_payload')
+        digest = hashlib.sha256(raw['payload_json'].encode()).hexdigest()
+        if existing:
+            if existing['digest'] != digest:
+                raise Failure(409, 'job_conflict')
+            return respond(start_response, 202, b'{"pending":true}', cors)
+        # Validate the fixed, bounded Responses shape before redeeming a paid-call capability.
+        request_payload = json.loads(raw['payload_json'], object_pairs_hook=unique_object)
+        payload_from(json.dumps(request_payload).encode(), model)
+        with _lock:
+            if len(_renstroy_jobs) >= 16 or len(_jobs) >= 16:
+                raise Failure(503, 'worker_busy')
+        redeem_renstroy_ticket(raw['ticket'], digest)
+        with _lock:
+            _renstroy_jobs[job_id] = {'token_hash': token_hash, 'digest': digest, 'expires': time.time() + JOB_TTL}
+        status, body = job_request(json.dumps({'job_id': job_id, 'request': request_payload}).encode(), model, key)
+        return respond(start_response, status, body, cors)
+    except Failure as error:
+        return respond(start_response, error.status, json.dumps({'error': {'code': error.code}}).encode(), cors)
+    except (ValueError, TypeError, AttributeError, KeyError):
+        return respond(start_response, 400, b'{"error":{"code":"invalid_payload"}}', cors)
+
 
 
 

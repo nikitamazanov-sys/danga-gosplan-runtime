@@ -29,3 +29,7 @@ Job IDs are 32 lowercase hex characters. Repeating the same ID and payload does 
 Jobs and results are held only in process memory, with two concurrent jobs, at most 16 retained jobs, and 15-minute retention after completion. Restarting the process loses results that the portal has not collected. The portal must collect and save responses promptly; its existing minute scheduler also collects when the browser is closed. A missing job is reported explicitly and never silently resubmitted. Deploy only when no paid jobs are active.
 
 Run transport regression tests with `python3 -m unittest -v test_async_jobs.py`.
+
+## Renstroy estimates
+
+`/v1/renstroy/start` accepts an exact bounded Responses payload plus a single-use capability issued by an authenticated founder at cabinet.renstroy.com. The worker redeems the capability against that fixed HTTPS origin; the ticket binds the SHA-256 of the complete prompt. No provider key or shared Gosplan secret is copied. `/v1/renstroy/result` requires the matching 256-bit polling token. Repeated submits with the same live job and token do not repeat the paid request. CORS is restricted to renstroy.com and www.renstroy.com. The existing concurrency, JSON validation, no-redirect upstream client and 15-minute in-memory result retention remain in force. The Renstroy server saves retrieved results and answers. Provider model and credentials remain the existing Gosplan configuration. Tests: `python3 -m unittest -v test_renstroy`.

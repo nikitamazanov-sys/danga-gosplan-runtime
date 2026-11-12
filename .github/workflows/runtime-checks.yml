@@ -22,6 +22,6 @@ jobs:
       - name: Check Python syntax
         run: python -m py_compile worker.py free_translate.py build_translation_model.py
       - name: Test jobs, metering and translation without paid calls
-        run: python -m unittest -v test_async_jobs test_metering test_translation
+        run: python -m unittest -v test_async_jobs test_metering test_translation test_realtime test_renstroy
       - name: Report release status
         run: echo 'Tests only; no Render deployment was attempted.' >> "$GITHUB_STEP_SUMMARY"
