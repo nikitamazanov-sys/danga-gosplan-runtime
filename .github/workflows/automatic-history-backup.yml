@@ -1,0 +1,68 @@
+name: Automatic repository history backup
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 0 * * *'
+  push:
+    branches: [main, backup/automatic-copy-20261115]
+permissions:
+  contents: write
+concurrency:
+  group: repository-history-backup
+  cancel-in-progress: false
+jobs:
+  backup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BACKUP_SSH_KEY: ${{ secrets.GITLAB_BACKUP_SSH_KEY }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Test independent restore and immutable history
+        run: python3 -m unittest discover -s ops/backups -p 'test_snapshot.py' -v
+      - name: Configure short-lived GitHub authentication
+        run: gh auth setup-git --hostname github.com
+      - name: Configure optional project-scoped GitLab transport
+        shell: bash
+        run: |
+          if [ -n "$BACKUP_SSH_KEY" ]; then
+            umask 077
+            printf '%s\n' "$BACKUP_SSH_KEY" > "$RUNNER_TEMP/gitlab-backup-key"
+            printf '%s\n' 'gitlab.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAfuCHKVTjquxvt6CM6tdG4SLp1Btn/nOeHHE5UOzRdf' > "$RUNNER_TEMP/gitlab-known-hosts"
+            echo "GIT_SSH_COMMAND=ssh -i $RUNNER_TEMP/gitlab-backup-key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/gitlab-known-hosts" >> "$GITHUB_ENV"
+            echo 'GITLAB_BACKUP_READY=true' >> "$GITHUB_ENV"
+          fi
+      - name: Preserve refs and verify independent restore
+        shell: bash
+        run: |
+          slug="${GITHUB_REPOSITORY##*/}"
+          snapshot="$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          args=(--slug "$slug" --snapshot "$snapshot" --receipt "$RUNNER_TEMP/backup-receipt.json")
+          if [ "${GITLAB_BACKUP_READY:-}" = 'true' ]; then
+            args+=(--gitlab 'git@gitlab.com:nikita-websites-backup/websites-backup.git')
+          fi
+          python3 ops/backups/snapshot.py "${args[@]}"
+      - name: Retain verification receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: repository-backup-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/backup-receipt.json
+          if-no-files-found: warn
+          retention-days: 7
+      - name: State exact coverage
+        if: always()
+        shell: bash
+        run: |
+          echo 'Git history only. Live databases, uploads, hosting-only files, LFS payloads, submodule repositories and four-provider archive parity are not covered by this job.' >> "$GITHUB_STEP_SUMMARY"
+          if [ "${GITLAB_BACKUP_READY:-}" != 'true' ]; then
+            echo 'GitLab transport is NOT configured. A GitHub-only snapshot does not complete external backup.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Remove temporary transport material
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/gitlab-backup-key" "$RUNNER_TEMP/gitlab-known-hosts"
