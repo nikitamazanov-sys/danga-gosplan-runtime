@@ -329,6 +329,59 @@ def job_request(body, model, key, result_only=False):
     return 202, b'{"pending":true}'
 
 
+def transcription_request(body, key):
+    """Bounded signed recording -> transcript. No audio or transcript is logged/persisted."""
+    try:
+        raw = json.loads(body, object_pairs_hook=unique_object)
+        if not isinstance(raw, dict) or set(raw) != {"mime", "audio"}:
+            raise ValueError()
+        mime, encoded = raw["mime"], raw["audio"]
+        extensions = {"audio/mp4": "mp4", "audio/webm": "webm", "audio/wav": "wav", "audio/mpeg": "mp3", "audio/ogg": "ogg"}
+        if mime not in extensions or not isinstance(encoded, str) or len(encoded) > 4194304:
+            raise ValueError()
+        audio = base64.b64decode(encoded, validate=True)
+        if not 128 <= len(audio) <= 3145728:
+            raise ValueError()
+        valid = ((mime == "audio/mp4" and audio[4:8] == b"ftyp")
+                 or (mime == "audio/webm" and audio[:4] == bytes.fromhex("1a45dfa3"))
+                 or (mime == "audio/wav" and audio[:4] == b"RIFF" and audio[8:12] == b"WAVE")
+                 or (mime == "audio/ogg" and audio.startswith(b"OggS"))
+                 or (mime == "audio/mpeg" and (audio.startswith(b"ID3") or (audio[0] == 255 and audio[1] & 224 == 224))))
+        if not valid:
+            raise ValueError()
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise Failure(400, "invalid_audio") from None
+    boundary = "ordnung-" + os.urandom(16).hex()
+    parts = []
+    for name, value in (("model", "gpt-transcribe"), ("languages[]", "ru")):
+        parts.append(("--" + boundary + '\r\nContent-Disposition: form-data; name="' + name + '"\r\n\r\n' + value + "\r\n").encode())
+    parts.append(("--" + boundary + '\r\nContent-Disposition: form-data; name="file"; filename="voice.' + extensions[mime] + '"\r\nContent-Type: ' + mime + '\r\n\r\n').encode() + audio + b"\r\n")
+    multipart = b"".join(parts) + ("--" + boundary + "--\r\n").encode()
+    request = urllib.request.Request("https://api.openai.com/v1/audio/transcriptions", data=multipart,
+        headers={"Authorization": "Bearer " + key, "Content-Type": "multipart/form-data; boundary=" + boundary}, method="POST")
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=120) as response:
+            result = response.read(65537)
+        if len(result) > 65536:
+            raise Failure(502, "transcript_too_large")
+        result = json.loads(result)
+        text = result.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > 12000:
+            raise Failure(502, "empty_transcript")
+        return json.dumps({"text": text.strip()}, ensure_ascii=False).encode()
+    except urllib.error.HTTPError as error:
+        code = "voice_upstream_error"
+        try:
+            candidate = json.loads(error.read(16384)).get("error", {}).get("code")
+            if candidate in {"model_not_found", "insufficient_quota", "billing_not_active", "invalid_api_key", "unsupported_country_region_territory"}:
+                code = candidate
+        except (ValueError, AttributeError):
+            pass
+        raise Failure(error.code if error.code in {400, 401, 403, 404, 429} else 502, code) from None
+    except (OSError, TimeoutError, ValueError, AttributeError):
+        raise Failure(502, "voice_upstream_unavailable") from None
+
+
 def application(environ, start_response):
     acquired = False
     translation_acquired = False
@@ -341,7 +394,7 @@ def application(environ, start_response):
             return respond(start_response, 200, b'{"status":"configured"}')
         if path.startswith('/v1/renstroy/'):
             return renstroy_application(environ, start_response)
-        if path not in {"/v1/analyze", "/v1/jobs", "/v1/jobs/result", "/v1/translate", "/v1/academy/realtime", "/v1/academy/realtime/end"}:
+        if path not in {"/v1/ordnung/transcribe", "/v1/analyze", "/v1/jobs", "/v1/jobs/result", "/v1/translate", "/v1/academy/realtime", "/v1/academy/realtime/end"}:
             raise Failure(404, "not_found")
         if method != "POST":
             raise Failure(405, "method_not_allowed")
@@ -355,10 +408,17 @@ def application(environ, start_response):
             raise Failure(413, "payload_too_large")
         if path == '/v1/translate' and int(length)>65536:
             raise Failure(413,'payload_too_large')
+        if path == "/v1/ordnung/transcribe" and int(length) > 4300000:
+            raise Failure(413, "payload_too_large")
         body = environ["wsgi.input"].read(int(length))
         if len(body) != int(length):
             raise Failure(400, "incomplete_body")
         authenticate(environ, body, secret, poll=path == "/v1/jobs/result")
+        if path == "/v1/ordnung/transcribe":
+            acquired = _slots.acquire(blocking=False)
+            if not acquired:
+                raise Failure(503, "worker_busy")
+            return respond(start_response, 200, transcription_request(body, key))
         if path.startswith('/v1/academy/realtime'):
             if len(body) > 100000:
                 raise Failure(413, 'payload_too_large')
@@ -487,6 +547,7 @@ def renstroy_application(environ, start_response):
         return respond(start_response, error.status, json.dumps({'error': {'code': error.code}}).encode(), cors)
     except (ValueError, TypeError, AttributeError, KeyError):
         return respond(start_response, 400, b'{"error":{"code":"invalid_payload"}}', cors)
+
 
 
 
